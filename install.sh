@@ -22,6 +22,8 @@ DEFAULT_CONTAINER_PORT="8317"
 DEFAULT_HOST_PORT="8317"
 DEFAULT_PANEL_REPO="https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 
+SECRETS_FILE=".cliproxyapi_secrets"
+
 # ---- 基础工具函数 ----
 info() { echo -e "\033[32m[INFO]\033[0m $1"; }
 warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
@@ -110,6 +112,65 @@ get_management_key_from_config() {
     fi
 }
 
+is_bcrypt_hash() {
+    local value="${1:-}"
+    [[ "$value" =~ ^\$2[aby]\$[0-9]{2}\$.* ]]
+}
+
+write_secrets_file() {
+    local api_key="$1"
+    local management_key="$2"
+
+    cat > "$SECRETS_FILE" <<EOF
+API_KEY="${api_key}"
+MANAGEMENT_KEY="${management_key}"
+EOF
+    chmod 600 "$SECRETS_FILE"
+}
+
+get_api_key_from_secrets() {
+    if [[ -f "$SECRETS_FILE" ]]; then
+        sed -n 's/^API_KEY="\([^"]*\)"$/\1/p' "$SECRETS_FILE" | head -n 1
+    fi
+}
+
+get_management_key_from_secrets() {
+    if [[ -f "$SECRETS_FILE" ]]; then
+        sed -n 's/^MANAGEMENT_KEY="\([^"]*\)"$/\1/p' "$SECRETS_FILE" | head -n 1
+    fi
+}
+
+sync_secrets_from_config_if_missing() {
+    local api_key=""
+    local management_key=""
+
+    if [[ -f "$SECRETS_FILE" ]]; then
+        return 0
+    fi
+
+    api_key="$(get_api_key_from_config)"
+    management_key="$(get_management_key_from_config)"
+
+    if [[ -n "$api_key" && -n "$management_key" ]] && ! is_bcrypt_hash "$management_key"; then
+        write_secrets_file "$api_key" "$management_key"
+        return 0
+    fi
+
+    return 1
+}
+
+display_management_key_notice() {
+    local display_value="${1:-}"
+
+    if [[ -n "$display_value" ]]; then
+        echo -e "管理密钥: \033[33m${display_value}\033[0m"
+    else
+        echo -e "管理密钥: \033[31m当前无法显示原始明文\033[0m"
+        echo -e "         \033[33m原因：config.yaml 中可能已是哈希值，无法反推出原始密钥。\033[0m"
+        echo -e "         \033[33m建议：手动重置 remote-management.secret-key 后重启服务。\033[0m"
+    fi
+}
+
 health_check_service() {
     local host_port="$1"
     local api_key="$2"
@@ -169,7 +230,6 @@ download_official_files() {
     info "正在拉取官方 docker-compose.yml ..."
     curl -fsSL "$COMPOSE_URL" -o docker-compose.yml || return 1
 
-    # 仅作留档参考，失败不阻断部署
     curl -fsSL "$CONFIG_EXAMPLE_URL" -o config.example.yaml >/dev/null 2>&1 || true
     return 0
 }
@@ -282,6 +342,7 @@ backup_checksum() {
 # ---- 1. 一键部署系统 ----
 deploy_cliproxyapi() {
     info "== 启动 CLIProxyAPI 自动化部署编排 =="
+
     require_cmd docker
     require_cmd curl
     require_cmd openssl
@@ -336,6 +397,9 @@ deploy_cliproxyapi() {
     info "正在生成最小可用 config.yaml ..."
     generate_config_yaml "./config.yaml" "$DEFAULT_CONTAINER_PORT" "$api_key" "$management_key"
 
+    info "正在写入密钥保存文件 ..."
+    write_secrets_file "$api_key" "$management_key"
+
     info "正在调整 docker-compose 端口映射 ..."
     patch_compose_ports "$host_port"
 
@@ -364,6 +428,7 @@ deploy_cliproxyapi() {
     echo -e "配置文件: \033[36m${install_path}/config.yaml\033[0m"
     echo -e "认证目录: \033[36m${install_path}/auths\033[0m"
     echo -e "日志目录: \033[36m${install_path}/logs\033[0m"
+    echo -e "密钥文件: \033[36m${install_path}/${SECRETS_FILE}\033[0m"
     echo -e "==================================================\n"
 
     health_check_service "$host_port" "$api_key"
@@ -374,22 +439,27 @@ deploy_cliproxyapi() {
 # ---- 2. 升级服务 ----
 upgrade_service() {
     local workdir=""
+    local host_port=""
+    local api_key=""
+
     workdir="$(get_workdir)"
     if [[ -z "$workdir" ]]; then
         err "未检测到运行中的实例，请先执行 [1] 一键部署。"
         return
     fi
+
     cd "$workdir" || return
     info "正在拉取最新镜像并重建容器..."
     run_dc pull
     run_dc up -d
     info "升级服务完成。"
 
-    local host_port=""
-    local api_key=""
     host_port="$(get_host_port_from_compose)"
     [[ -z "$host_port" ]] && host_port="$DEFAULT_HOST_PORT"
-    api_key="$(get_api_key_from_config)"
+
+    api_key="$(get_api_key_from_secrets)"
+    [[ -z "$api_key" ]] && api_key="$(get_api_key_from_config)"
+
     [[ -n "$api_key" ]] && health_check_service "$host_port" "$api_key"
 }
 
@@ -423,7 +493,10 @@ restart_service() {
 
     host_port="$(get_host_port_from_compose)"
     [[ -z "$host_port" ]] && host_port="$DEFAULT_HOST_PORT"
-    api_key="$(get_api_key_from_config)"
+
+    api_key="$(get_api_key_from_secrets)"
+    [[ -z "$api_key" ]] && api_key="$(get_api_key_from_config)"
+
     [[ -n "$api_key" ]] && health_check_service "$host_port" "$api_key"
 }
 
@@ -459,7 +532,8 @@ do_backup() {
         config.yaml \
         auths \
         logs \
-        config.example.yaml 2>/dev/null || {
+        config.example.yaml \
+        "$SECRETS_FILE" 2>/dev/null || {
         err "备份失败，请检查文件权限或目录是否完整。"
         return
     }
@@ -500,6 +574,7 @@ restore_backup() {
     local host_port=""
     local api_key=""
     local management_key=""
+    local management_key_config=""
 
     current_wd="$(get_workdir)"
     search_dir="${current_wd:-$DEFAULT_INSTALL_PATH}/backups"
@@ -549,6 +624,9 @@ restore_backup() {
     mkdir -p auths logs backups
     chmod -R 755 auths logs backups || true
     chmod 600 config.yaml .env 2>/dev/null || true
+    chmod 600 "$SECRETS_FILE" 2>/dev/null || true
+
+    sync_secrets_from_config_if_missing || true
 
     run_dc up -d || { err "恢复启动失败。"; return; }
 
@@ -562,8 +640,11 @@ restore_backup() {
     host_port="$(get_host_port_from_compose)"
     [[ -z "$host_port" ]] && host_port="$DEFAULT_HOST_PORT"
 
-    api_key="$(get_api_key_from_config)"
-    management_key="$(get_management_key_from_config)"
+    api_key="$(get_api_key_from_secrets)"
+    [[ -z "$api_key" ]] && api_key="$(get_api_key_from_config)"
+
+    management_key="$(get_management_key_from_secrets)"
+    management_key_config="$(get_management_key_from_config)"
 
     echo -e "\n=================================================="
     echo -e "\033[32m✅ CLIProxyAPI 恢复完成！\033[0m"
@@ -571,8 +652,12 @@ restore_backup() {
     echo -e "OpenAI 兼容接口: \033[36mhttp://${server_ip}:${host_port}/v1\033[0m"
     echo -e "管理页面: \033[36mhttp://${server_ip}:${host_port}/management.html\033[0m"
     echo -e "API Key: \033[33m${api_key:-请查看 config.yaml}\033[0m"
-    echo -e "管理密钥: \033[33m${management_key:-请查看 config.yaml}\033[0m"
+    display_management_key_notice "$management_key"
     echo -e "==================================================\n"
+
+    if [[ -z "$management_key" && -n "$management_key_config" ]] && is_bcrypt_hash "$management_key_config"; then
+        warn "检测到 config.yaml 中的 secret-key 已是哈希值。由于旧版本未单独保存明文密钥，无法直接显示原始管理密钥。"
+    fi
 
     [[ -n "$api_key" ]] && health_check_service "$host_port" "$api_key"
 }
@@ -590,6 +675,7 @@ setup_auto_backup() {
     local hour=""
     local minute=""
     local tmp_cron=""
+    local reset_cron=""
 
     existing_cron="$(crontab -l 2>/dev/null | sed -n "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/p" | grep -v "^#" || true)"
 
@@ -720,6 +806,7 @@ repair_current_install() {
     local host_port=""
     local api_key=""
     local management_key=""
+    local config_key=""
 
     workdir="$(get_workdir)"
     if [[ -z "$workdir" ]]; then
@@ -740,15 +827,24 @@ repair_current_install() {
     host_port="$(get_host_port_from_compose)"
     [[ -z "$host_port" ]] && host_port="$DEFAULT_HOST_PORT"
 
-    api_key="$(get_api_key_from_config)"
+    api_key="$(get_api_key_from_secrets)"
+    [[ -z "$api_key" ]] && api_key="$(get_api_key_from_config)"
     [[ -z "$api_key" ]] && api_key="sk-$(random_string 12)"
 
-    management_key="$(get_management_key_from_config)"
+    management_key="$(get_management_key_from_secrets)"
+    if [[ -z "$management_key" ]]; then
+        config_key="$(get_management_key_from_config)"
+        if [[ -n "$config_key" ]] && ! is_bcrypt_hash "$config_key"; then
+            management_key="$config_key"
+        fi
+    fi
     [[ -z "$management_key" ]] && management_key="mgmt-$(random_string 12)"
 
     cp -f config.yaml "config.yaml.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
     generate_config_yaml "./config.yaml" "$DEFAULT_CONTAINER_PORT" "$api_key" "$management_key"
     chmod 600 config.yaml
+
+    write_secrets_file "$api_key" "$management_key"
 
     info "配置已重写为兼容当前官方结构的版本。"
     run_dc down || true
@@ -763,6 +859,7 @@ repair_current_install() {
     echo -e "\n=================================================="
     echo -e "API Key: \033[33m${api_key}\033[0m"
     echo -e "管理密钥: \033[33m${management_key}\033[0m"
+    echo -e "密钥文件: \033[36m$(pwd)/${SECRETS_FILE}\033[0m"
     echo -e "==================================================\n"
 
     health_check_service "$host_port" "$api_key"
