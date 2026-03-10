@@ -2,8 +2,10 @@
 
 # ==========================================
 # CLIProxyAPI 运维控制台
-# 基于官方 docker-compose.yml 适配
+# 适配当前官方 docker-compose.yml / config.example.yaml
 # ==========================================
+
+set -u
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 DEFAULT_INSTALL_PATH="/opt/cliproxyapi"
@@ -15,6 +17,10 @@ ENV_FILE="/etc/cliproxyapi_env"
 CRON_TAG_BEGIN="# CLIPROXYAPI_BACKUP_BEGIN"
 CRON_TAG_END="# CLIPROXYAPI_BACKUP_END"
 BACKUP_LOG="/var/log/cliproxyapi_backup.log"
+
+DEFAULT_CONTAINER_PORT="8317"
+DEFAULT_HOST_PORT="8317"
+DEFAULT_PANEL_REPO="https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 
 # ---- 基础工具函数 ----
 info() { echo -e "\033[32m[INFO]\033[0m $1"; }
@@ -54,7 +60,139 @@ random_string() {
     openssl rand -hex "${1:-16}"
 }
 
-# ---- 生成最小可用配置 ----
+run_dc() {
+    local dc_cmd
+    dc_cmd="$(docker_compose_cmd)"
+    $dc_cmd -f docker-compose.yml "$@"
+}
+
+ensure_runtime_dirs() {
+    mkdir -p auths logs backups || return 1
+    chmod 755 auths logs backups || true
+    return 0
+}
+
+port_in_use() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn "( sport = :${port} )" 2>/dev/null | grep -q ":${port} "
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | grep -q "[.:]${port}[[:space:]]"
+    else
+        return 1
+    fi
+}
+
+get_host_port_from_compose() {
+    if [[ -f docker-compose.yml ]]; then
+        grep -oP '"\K[0-9]+(?=:8317")' docker-compose.yml 2>/dev/null | head -n 1
+    fi
+}
+
+get_api_key_from_config() {
+    if [[ -f config.yaml ]]; then
+        awk '
+            /^api-keys:/ { in_keys=1; next }
+            in_keys && /^[^[:space:]-]/ { exit }
+            in_keys && /^[[:space:]]*-[[:space:]]*"/ {
+                gsub(/^[[:space:]]*-[[:space:]]*"/, "", $0)
+                gsub(/".*$/, "", $0)
+                print $0
+                exit
+            }
+        ' config.yaml
+    fi
+}
+
+get_management_key_from_config() {
+    if [[ -f config.yaml ]]; then
+        grep -oP '^[[:space:]]*secret-key:\s*"\K[^"]+' config.yaml 2>/dev/null | head -n 1
+    fi
+}
+
+health_check_service() {
+    local host_port="$1"
+    local api_key="$2"
+
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "系统未安装 curl，跳过健康检查。"
+        return 0
+    fi
+
+    local code_models=""
+    local code_panel=""
+
+    code_models="$(curl -sS -o /tmp/cliproxyapi_models.out -w "%{http_code}" \
+        -H "Authorization: Bearer ${api_key}" \
+        "http://127.0.0.1:${host_port}/v1/models" || true)"
+
+    code_panel="$(curl -sS -o /tmp/cliproxyapi_panel.out -w "%{http_code}" \
+        "http://127.0.0.1:${host_port}/management.html" || true)"
+
+    if [[ "$code_models" =~ ^(200|401|403|500)$ ]]; then
+        info "API 健康检查已执行，/v1/models 返回 HTTP ${code_models}。"
+    else
+        warn "API 健康检查异常，/v1/models 返回 HTTP ${code_models:-unknown}。"
+    fi
+
+    if [[ "$code_panel" == "200" ]]; then
+        info "管理页面检查通过，/management.html 可访问。"
+    elif [[ "$code_panel" == "404" ]]; then
+        warn "管理页面返回 404。通常表示控制面板资源未下载成功，或已被配置禁用。"
+    else
+        warn "管理页面检查结果：HTTP ${code_panel:-unknown}。"
+    fi
+
+    rm -f /tmp/cliproxyapi_models.out /tmp/cliproxyapi_panel.out 2>/dev/null || true
+}
+
+wait_for_container_ready() {
+    local timeout="${1:-30}"
+    local elapsed=0
+
+    while (( elapsed < timeout )); do
+        local status
+        status="$(run_dc ps --format json 2>/dev/null | grep -o '"State":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)"
+
+        if [[ "$status" == "running" ]]; then
+            return 0
+        fi
+
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    return 1
+}
+
+download_official_files() {
+    info "正在拉取官方 docker-compose.yml ..."
+    curl -fsSL "$COMPOSE_URL" -o docker-compose.yml || return 1
+
+    # 仅作留档参考，失败不阻断部署
+    curl -fsSL "$CONFIG_EXAMPLE_URL" -o config.example.yaml >/dev/null 2>&1 || true
+    return 0
+}
+
+patch_compose_ports() {
+    local host_port="$1"
+
+    if grep -q '"8317:8317"' docker-compose.yml; then
+        sed -i "s/\"8317:8317\"/\"${host_port}:8317\"/g" docker-compose.yml
+    else
+        warn "未在 docker-compose.yml 中找到默认端口映射 8317:8317，请手动检查。"
+    fi
+}
+
+write_env_file() {
+    cat > .env <<EOF
+DEPLOY=docker
+CLI_PROXY_CONFIG_PATH=./config.yaml
+CLI_PROXY_AUTH_PATH=./auths
+CLI_PROXY_LOG_PATH=./logs
+EOF
+}
+
 generate_config_yaml() {
     local config_path="$1"
     local server_port="$2"
@@ -62,32 +200,83 @@ generate_config_yaml() {
     local management_key="$4"
 
     cat > "$config_path" <<EOF
-server:
-  port: ${server_port}
+host: ""
+port: ${server_port}
 
-# 给客户端调用的 API Key
+tls:
+  enable: false
+  cert: ""
+  key: ""
+
+remote-management:
+  allow-remote: true
+  secret-key: "${management_key}"
+  disable-control-panel: false
+  panel-github-repository: "${DEFAULT_PANEL_REPO}"
+
+auth-dir: "/root/.cli-proxy-api"
+
 api-keys:
   - "${api_key}"
 
-# 管理页面密钥
-management-key: "${management_key}"
+debug: true
+logging-to-file: false
+logs-max-total-size-mb: 0
+error-logs-max-files: 10
+usage-statistics-enabled: false
+proxy-url: ""
+force-model-prefix: false
+passthrough-headers: false
+request-retry: 3
+max-retry-credentials: 0
+max-retry-interval: 30
 
-# 建议开启请求日志，排查问题方便些
-request-log: true
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
 
-# 下面留空，按需自行补充供应商配置
-# 支持渠道可参考官方 config.example.yaml
+routing:
+  strategy: "round-robin"
+
+ws-auth: false
+nonstream-keepalive-interval: 0
+
+# 下面按需自行补充实际渠道配置
 # 例如：
 #
-# gemini-cli:
-#   - path: "/root/.config/google-generative-ai"
+# gemini-api-key:
+#   - api-key: "AIzaSy..."
 #
-# claude:
-#   - email: "your-email@example.com"
+# codex-api-key:
+#   - api-key: "sk-..."
 #
-# codex:
-#   - email: "your-email@example.com"
+# claude-api-key:
+#   - api-key: "sk-..."
+#
+# openai-compatibility:
+#   - name: "openrouter"
+#     base-url: "https://openrouter.ai/api/v1"
+#     api-key-entries:
+#       - api-key: "sk-or-..."
+#     models:
+#       - name: "moonshotai/kimi-k2:free"
+#         alias: "kimi-k2"
 EOF
+}
+
+verify_backup_file() {
+    local backup_file="$1"
+    if [[ ! -f "$backup_file" ]]; then
+        return 1
+    fi
+    gzip -t "$backup_file" >/dev/null 2>&1
+}
+
+backup_checksum() {
+    local backup_file="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$(basename "$backup_file")" > "$(basename "$backup_file").sha256"
+    fi
 }
 
 # ---- 1. 一键部署系统 ----
@@ -97,14 +286,22 @@ deploy_cliproxyapi() {
     require_cmd curl
     require_cmd openssl
 
-    local dc_cmd
+    local install_path=""
+    local input_path=""
+    local input_port=""
+    local host_port=""
+    local dc_cmd=""
+    local api_key=""
+    local management_key=""
+    local server_ip=""
+
     dc_cmd="$(docker_compose_cmd)"
 
     read -r -p "请输入安装路径 [默认: $DEFAULT_INSTALL_PATH]: " input_path
-    local install_path="${input_path:-$DEFAULT_INSTALL_PATH}"
+    install_path="${input_path:-$DEFAULT_INSTALL_PATH}"
 
     if [[ -d "$install_path" && -f "$install_path/docker-compose.yml" ]]; then
-        err "该路径已存在部署实例，请先执行 [8] 卸载。"
+        err "该路径已存在部署实例，请先执行 [8] 卸载，或换一个路径。"
         return
     fi
 
@@ -112,45 +309,48 @@ deploy_cliproxyapi() {
     echo "$install_path" > "$ENV_FILE"
     cd "$install_path" || return
 
-    read -r -p "请输入对外 API 访问端口 [默认: 8317]: " input_port
-    local host_port="${input_port:-8317}"
+    read -r -p "请输入对外 API 访问端口 [默认: $DEFAULT_HOST_PORT]: " input_port
+    host_port="${input_port:-$DEFAULT_HOST_PORT}"
 
-    info "正在拉取官方 docker-compose.yml ..."
-    curl -sSL "$COMPOSE_URL" -o docker-compose.yml || { err "下载 docker-compose.yml 失败。"; return; }
+    if [[ ! "$host_port" =~ ^[1-9][0-9]{0,4}$ ]] || (( host_port > 65535 )); then
+        err "端口输入无效。"
+        return
+    fi
+
+    if port_in_use "$host_port"; then
+        err "端口 ${host_port} 已被占用，请换一个端口。"
+        return
+    fi
+
+    download_official_files || { err "下载官方文件失败。"; return; }
 
     info "准备运行目录..."
-    mkdir -p auths logs || { err "创建数据目录失败。"; return; }
+    ensure_runtime_dirs || { err "创建数据目录失败。"; return; }
 
-    local api_key
-    local management_key
     api_key="sk-$(random_string 12)"
     management_key="mgmt-$(random_string 12)"
 
     info "正在生成 .env ..."
-    cat > .env <<EOF
-DEPLOY=docker
-CLI_PROXY_CONFIG_PATH=./config.yaml
-CLI_PROXY_AUTH_PATH=./auths
-CLI_PROXY_LOG_PATH=./logs
-EOF
+    write_env_file
 
     info "正在生成最小可用 config.yaml ..."
-    generate_config_yaml "./config.yaml" "8317" "$api_key" "$management_key"
+    generate_config_yaml "./config.yaml" "$DEFAULT_CONTAINER_PORT" "$api_key" "$management_key"
 
-    # 改写 docker-compose.yml 的端口映射，只改 8317 这一项
-    if grep -q '"8317:8317"' docker-compose.yml; then
-        sed -i "s/\"8317:8317\"/\"${host_port}:8317\"/g" docker-compose.yml
-    else
-        warn "未在 docker-compose.yml 中找到默认端口映射 8317:8317，可能上游结构已变化，请手动检查。"
-    fi
+    info "正在调整 docker-compose 端口映射 ..."
+    patch_compose_ports "$host_port"
 
-    chmod -R 755 auths logs
     chmod 600 config.yaml .env
+    chmod 644 docker-compose.yml config.example.yaml 2>/dev/null || true
 
     info "正在拉起 CLIProxyAPI 容器..."
     $dc_cmd -f docker-compose.yml up -d || { err "容器启动失败，请检查 Docker 状态。"; return; }
 
-    local server_ip
+    if wait_for_container_ready 30; then
+        info "容器已进入运行状态。"
+    else
+        warn "容器未在预期时间内进入 running，建议立刻查看日志。"
+    fi
+
     server_ip="$(get_local_ip)"
 
     echo -e "\n=================================================="
@@ -166,12 +366,14 @@ EOF
     echo -e "日志目录: \033[36m${install_path}/logs\033[0m"
     echo -e "==================================================\n"
 
-    warn "当前只是把 CLIProxyAPI 服务拉起来了。你还需要编辑 config.yaml，补充实际要用的渠道配置。"
+    health_check_service "$host_port" "$api_key"
+
+    warn "服务已部署。你仍需按业务需要编辑 config.yaml，补充实际要用的渠道配置。"
 }
 
 # ---- 2. 升级服务 ----
 upgrade_service() {
-    local workdir
+    local workdir=""
     workdir="$(get_workdir)"
     if [[ -z "$workdir" ]]; then
         err "未检测到运行中的实例，请先执行 [1] 一键部署。"
@@ -179,67 +381,99 @@ upgrade_service() {
     fi
     cd "$workdir" || return
     info "正在拉取最新镜像并重建容器..."
-    $(docker_compose_cmd) -f docker-compose.yml pull
-    $(docker_compose_cmd) -f docker-compose.yml up -d
-    info "升级服务完成！"
+    run_dc pull
+    run_dc up -d
+    info "升级服务完成。"
+
+    local host_port=""
+    local api_key=""
+    host_port="$(get_host_port_from_compose)"
+    [[ -z "$host_port" ]] && host_port="$DEFAULT_HOST_PORT"
+    api_key="$(get_api_key_from_config)"
+    [[ -n "$api_key" ]] && health_check_service "$host_port" "$api_key"
 }
 
 # ---- 3. 停止服务 ----
 pause_service() {
-    local workdir
+    local workdir=""
     workdir="$(get_workdir)"
     if [[ -z "$workdir" ]]; then
         err "未检测到运行中的实例，请先执行 [1] 一键部署。"
         return
     fi
     cd "$workdir" || return
-    $(docker_compose_cmd) -f docker-compose.yml stop || true
+    run_dc stop || true
     info "服务已停止。"
 }
 
 # ---- 4. 重启服务 ----
 restart_service() {
-    local workdir
+    local workdir=""
+    local host_port=""
+    local api_key=""
+
     workdir="$(get_workdir)"
     if [[ -z "$workdir" ]]; then
         err "未检测到运行中的实例，请先执行 [1] 一键部署。"
         return
     fi
     cd "$workdir" || return
-    $(docker_compose_cmd) -f docker-compose.yml restart || true
+    run_dc restart || true
     info "服务已重启。"
+
+    host_port="$(get_host_port_from_compose)"
+    [[ -z "$host_port" ]] && host_port="$DEFAULT_HOST_PORT"
+    api_key="$(get_api_key_from_config)"
+    [[ -n "$api_key" ]] && health_check_service "$host_port" "$api_key"
 }
 
 # ---- 5. 手动备份 ----
 do_backup() {
-    local workdir
+    local workdir=""
+    local backup_dir=""
+    local timestamp=""
+    local backup_file=""
+
     workdir="$(get_workdir)"
     if [[ -z "$workdir" ]]; then
         err "未检测到部署环境，无法执行备份。"
         return
     fi
 
-    local backup_dir="${workdir}/backups"
-    mkdir -p "$backup_dir"
-    local timestamp
-    timestamp="$(date +"%Y%m%d_%H%M%S")"
-    local backup_file="${backup_dir}/cliproxyapi_backup_${timestamp}.tar.gz"
-
-    info "开始执行备份..."
     cd "$workdir" || return
 
+    if [[ ! -f docker-compose.yml || ! -f .env || ! -f config.yaml || ! -d auths || ! -d logs ]]; then
+        err "备份前检查失败：缺少必要文件或目录。"
+        return
+    fi
+
+    backup_dir="${workdir}/backups"
+    mkdir -p "$backup_dir"
+    timestamp="$(date +"%Y%m%d_%H%M%S")"
+    backup_file="${backup_dir}/cliproxyapi_backup_${timestamp}.tar.gz"
+
+    info "开始执行备份..."
     tar -czf "$backup_file" \
         docker-compose.yml \
         .env \
         config.yaml \
         auths \
-        logs 2>/dev/null || {
+        logs \
+        config.example.yaml 2>/dev/null || {
         err "备份失败，请检查文件权限或目录是否完整。"
         return
     }
 
+    if ! verify_backup_file "$backup_file"; then
+        err "备份包校验失败，gzip 测试未通过。"
+        rm -f "$backup_file"
+        return
+    fi
+
     cd "$backup_dir" || return
+    backup_checksum "$backup_file"
     ls -t cliproxyapi_backup_*.tar.gz 2>/dev/null | awk 'NR>3' | xargs -r rm -f
+    ls -t cliproxyapi_backup_*.tar.gz.sha256 2>/dev/null | awk 'NR>3' | xargs -r rm -f
 
     info "备份执行完毕。当前可用备份如下："
     for f in $(ls -t cliproxyapi_backup_*.tar.gz 2>/dev/null); do
@@ -255,15 +489,25 @@ restore_backup() {
     info "== 灾备恢复 / 数据迁入引擎 =="
 
     local default_backup=""
-    local current_wd
+    local current_wd=""
+    local search_dir=""
+    local backup_path=""
+    local input_backup=""
+    local input_path=""
+    local target_dir=""
+    local force_override=""
+    local server_ip=""
+    local host_port=""
+    local api_key=""
+    local management_key=""
+
     current_wd="$(get_workdir)"
-    local search_dir="${current_wd:-$DEFAULT_INSTALL_PATH}/backups"
+    search_dir="${current_wd:-$DEFAULT_INSTALL_PATH}/backups"
 
     if [[ -d "$search_dir" ]]; then
         default_backup="$(ls -t "${search_dir}"/cliproxyapi_backup_*.tar.gz 2>/dev/null | head -n 1 || true)"
     fi
 
-    local backup_path=""
     if [[ -n "$default_backup" ]]; then
         echo -e "已检测到最新备份快照: \033[33m${default_backup}\033[0m"
         read -r -p "请输入备份文件路径 [直接回车使用默认]: " input_backup
@@ -277,8 +521,13 @@ restore_backup() {
         return
     fi
 
+    if ! verify_backup_file "$backup_path"; then
+        err "备份文件校验失败，gzip 测试未通过。"
+        return
+    fi
+
     read -r -p "请输入恢复到的目标路径 [默认: $DEFAULT_INSTALL_PATH]: " input_path
-    local target_dir="${input_path:-$DEFAULT_INSTALL_PATH}"
+    target_dir="${input_path:-$DEFAULT_INSTALL_PATH}"
 
     if [[ -d "$target_dir" && -f "$target_dir/docker-compose.yml" ]]; then
         warn "目标目录已存在实例，恢复将覆盖现有数据。"
@@ -287,7 +536,8 @@ restore_backup() {
             info "已终止恢复流程。"
             return
         fi
-        cd "$target_dir" && $(docker_compose_cmd) -f docker-compose.yml down || true
+        cd "$target_dir" || return
+        run_dc down || true
     fi
 
     mkdir -p "$target_dir"
@@ -296,21 +546,24 @@ restore_backup() {
     echo "$target_dir" > "$ENV_FILE"
     cd "$target_dir" || return
 
-    chmod -R 755 auths logs || true
-    chmod 600 config.yaml .env || true
+    mkdir -p auths logs backups
+    chmod -R 755 auths logs backups || true
+    chmod 600 config.yaml .env 2>/dev/null || true
 
-    $(docker_compose_cmd) -f docker-compose.yml up -d || { err "恢复启动失败。"; return; }
+    run_dc up -d || { err "恢复启动失败。"; return; }
 
-    local server_ip
+    if wait_for_container_ready 30; then
+        info "容器已进入运行状态。"
+    else
+        warn "容器未在预期时间内进入 running，建议查看日志。"
+    fi
+
     server_ip="$(get_local_ip)"
-    local host_port
-    host_port="$(grep -oP '"\K[0-9]+(?=:8317")' docker-compose.yml | head -n 1)"
-    [[ -z "$host_port" ]] && host_port="8317"
+    host_port="$(get_host_port_from_compose)"
+    [[ -z "$host_port" ]] && host_port="$DEFAULT_HOST_PORT"
 
-    local api_key
-    api_key="$(grep -A2 '^api-keys:' config.yaml | grep -oP '"\K[^"]+' | head -n 1)"
-    local management_key
-    management_key="$(grep -oP '^management-key:\s*"\K[^"]+' config.yaml | head -n 1)"
+    api_key="$(get_api_key_from_config)"
+    management_key="$(get_management_key_from_config)"
 
     echo -e "\n=================================================="
     echo -e "\033[32m✅ CLIProxyAPI 恢复完成！\033[0m"
@@ -320,6 +573,8 @@ restore_backup() {
     echo -e "API Key: \033[33m${api_key:-请查看 config.yaml}\033[0m"
     echo -e "管理密钥: \033[33m${management_key:-请查看 config.yaml}\033[0m"
     echo -e "==================================================\n"
+
+    [[ -n "$api_key" ]] && health_check_service "$host_port" "$api_key"
 }
 
 # ---- 7. 定时备份 ----
@@ -328,6 +583,14 @@ setup_auto_backup() {
     info "== 定时备份策略管控 =="
 
     local existing_cron=""
+    local cron_type=""
+    local cron_spec=""
+    local min_interval=""
+    local cron_time=""
+    local hour=""
+    local minute=""
+    local tmp_cron=""
+
     existing_cron="$(crontab -l 2>/dev/null | sed -n "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/p" | grep -v "^#" || true)"
 
     if [[ -n "$existing_cron" ]]; then
@@ -348,24 +611,27 @@ setup_auto_backup() {
     echo " 3) 删除当前的定时备份任务"
     read -r -p "请选择策略 [1/2/3]: " cron_type
 
-    local cron_spec=""
-
     if [[ "$cron_type" == "1" ]]; then
         read -r -p "请输入间隔分钟数 (例如 30): " min_interval
-        if [[ ! "$min_interval" =~ ^[1-9][0-9]*$ ]]; then err "输入无效。"; return; fi
+        if [[ ! "$min_interval" =~ ^[1-9][0-9]*$ ]]; then
+            err "输入无效。"
+            return
+        fi
         cron_spec="*/${min_interval} * * * *"
         info "已设置：每 ${min_interval} 分钟执行一次。"
     elif [[ "$cron_type" == "2" ]]; then
         read -r -p "请输入每天固定备份时间 (格式 HH:MM): " cron_time
-        if [[ ! "$cron_time" =~ ^([0-1][0-9]|2[0-3]):[0-5][0-9]$ ]]; then err "时间格式不正确。"; return; fi
-        local hour="${cron_time%:*}"
-        local minute="${cron_time#*:}"
+        if [[ ! "$cron_time" =~ ^([0-1][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+            err "时间格式不正确。"
+            return
+        fi
+        hour="${cron_time%:*}"
+        minute="${cron_time#*:}"
         hour="$(echo "$hour" | sed 's/^0*//')"; [[ -z "$hour" ]] && hour="0"
         minute="$(echo "$minute" | sed 's/^0*//')"; [[ -z "$minute" ]] && minute="0"
         cron_spec="${minute} ${hour} * * *"
         info "已设置：每天 ${cron_time} 执行一次。"
     elif [[ "$cron_type" == "3" ]]; then
-        local tmp_cron
         tmp_cron="$(mktemp)"
         crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
         crontab "$tmp_cron" 2>/dev/null || true
@@ -377,7 +643,6 @@ setup_auto_backup() {
         return
     fi
 
-    local tmp_cron
     tmp_cron="$(mktemp)"
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
     cat >> "$tmp_cron" <<EOF
@@ -393,7 +658,10 @@ EOF
 
 # ---- 8. 彻底卸载 ----
 uninstall_service() {
-    local workdir
+    local workdir=""
+    local confirm=""
+    local tmp_cron=""
+
     workdir="$(get_workdir)"
     if [[ -z "$workdir" ]]; then
         err "未检测到部署环境，无需卸载。"
@@ -408,13 +676,12 @@ uninstall_service() {
     fi
 
     cd "$workdir" || return
-    $(docker_compose_cmd) -f docker-compose.yml down -v || true
+    run_dc down -v || true
 
     cd /
     rm -rf "$workdir" || true
     rm -f "$ENV_FILE" || true
 
-    local tmp_cron
     tmp_cron="$(mktemp)"
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
     crontab "$tmp_cron" 2>/dev/null || true
@@ -425,14 +692,80 @@ uninstall_service() {
 
 # ---- 9. 查看状态 ----
 show_status() {
-    local workdir
+    local workdir=""
     workdir="$(get_workdir)"
     if [[ -z "$workdir" ]]; then
         err "未检测到部署实例。"
         return
     fi
     cd "$workdir" || return
-    $(docker_compose_cmd) -f docker-compose.yml ps
+    run_dc ps
+}
+
+# ---- 10. 查看日志 ----
+show_logs() {
+    local workdir=""
+    workdir="$(get_workdir)"
+    if [[ -z "$workdir" ]]; then
+        err "未检测到部署实例。"
+        return
+    fi
+    cd "$workdir" || return
+    docker logs --tail 200 cli-proxy-api
+}
+
+# ---- 11. 修复当前实例配置 ----
+repair_current_install() {
+    local workdir=""
+    local host_port=""
+    local api_key=""
+    local management_key=""
+
+    workdir="$(get_workdir)"
+    if [[ -z "$workdir" ]]; then
+        err "未检测到部署实例。"
+        return
+    fi
+
+    cd "$workdir" || return
+
+    if [[ ! -f docker-compose.yml ]]; then
+        err "未找到 docker-compose.yml。"
+        return
+    fi
+
+    mkdir -p auths logs backups
+    chmod -R 755 auths logs backups || true
+
+    host_port="$(get_host_port_from_compose)"
+    [[ -z "$host_port" ]] && host_port="$DEFAULT_HOST_PORT"
+
+    api_key="$(get_api_key_from_config)"
+    [[ -z "$api_key" ]] && api_key="sk-$(random_string 12)"
+
+    management_key="$(get_management_key_from_config)"
+    [[ -z "$management_key" ]] && management_key="mgmt-$(random_string 12)"
+
+    cp -f config.yaml "config.yaml.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    generate_config_yaml "./config.yaml" "$DEFAULT_CONTAINER_PORT" "$api_key" "$management_key"
+    chmod 600 config.yaml
+
+    info "配置已重写为兼容当前官方结构的版本。"
+    run_dc down || true
+    run_dc up -d || true
+
+    if wait_for_container_ready 30; then
+        info "容器已重新运行。"
+    else
+        warn "容器仍未进入 running，请查看 [10] 查看日志。"
+    fi
+
+    echo -e "\n=================================================="
+    echo -e "API Key: \033[33m${api_key}\033[0m"
+    echo -e "管理密钥: \033[33m${management_key}\033[0m"
+    echo -e "==================================================\n"
+
+    health_check_service "$host_port" "$api_key"
 }
 
 # ---- 交互式主菜单 ----
@@ -441,7 +774,7 @@ main_menu() {
     echo "==================================================="
     echo "               CLIProxyAPI 一键管理                "
     echo "==================================================="
-    local wd
+    local wd=""
     wd="$(get_workdir)"
     echo -e " 实例运行路径: \033[36m${wd:-未部署}\033[0m"
     echo "---------------------------------------------------"
@@ -454,10 +787,13 @@ main_menu() {
     echo "  7) 定时备份"
     echo "  8) 完全卸载"
     echo "  9) 查看状态"
+    echo " 10) 查看日志"
+    echo " 11) 修复当前实例配置"
     echo "  0) 退出脚本"
     echo "==================================================="
 
-    read -r -p "请输入操作序号 [0-9]: " choice
+    local choice=""
+    read -r -p "请输入操作序号 [0-11]: " choice
     case "$choice" in
         1) deploy_cliproxyapi ;;
         2) upgrade_service ;;
@@ -468,7 +804,9 @@ main_menu() {
         7) setup_auto_backup ;;
         8) uninstall_service ;;
         9) show_status ;;
-        0) info "欢迎下次使用，再见。"; exit 0 ;;
+        10) show_logs ;;
+        11) repair_current_install ;;
+        0) info "欢迎下次使用，再见。" ; exit 0 ;;
         *) warn "无效的指令，请重新输入。" ;;
     esac
 }
@@ -478,7 +816,7 @@ if [[ "${1:-}" == "run-backup" ]]; then
     do_backup
 else
     if [[ $EUID -ne 0 ]]; then
-        die "权限收敛：必须使用 Root 权限执行脚本。"
+        die "必须使用 Root 权限执行脚本。"
     fi
     while true; do
         main_menu
