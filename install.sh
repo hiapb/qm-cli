@@ -692,54 +692,94 @@ setup_auto_backup() {
         echo -e "当前未检测到定时备份任务。"
     fi
 
-    echo " 1) 按分钟间隔循环备份 (例如：每 30 分钟)"
-    echo " 2) 按每日固定时间点备份 (例如：每天 04:30)"
+    echo " 1) 按固定分钟步进备份（推荐：1/2/3/4/5/6/10/12/15/20/30）"
+    echo " 2) 按每日固定时间点备份（例如：每天 04:30）"
     echo " 3) 删除当前的定时备份任务"
     read -r -p "请选择策略 [1/2/3]: " cron_type
 
     if [[ "$cron_type" == "1" ]]; then
-        read -r -p "请输入间隔分钟数 (例如 30): " min_interval
-        if [[ ! "$min_interval" =~ ^[1-9][0-9]*$ ]]; then
-            err "输入无效。"
+        read -r -p "请输入间隔分钟数 [仅支持 1,2,3,4,5,6,10,12,15,20,30]: " min_interval
+
+        if [[ ! "$min_interval" =~ ^[0-9]+$ ]]; then
+            err "输入无效，必须是整数。"
             return
         fi
-        cron_spec="*/${min_interval} * * * *"
-        info "已设置：每 ${min_interval} 分钟执行一次。"
+
+        case "$min_interval" in
+            1|2|3|4|5|6|10|12|15|20|30)
+                cron_spec="*/${min_interval} * * * *"
+                info "已设置：每 ${min_interval} 分钟执行一次。"
+                ;;
+            *)
+                err "不支持该分钟间隔。为避免 cron 步进产生歧义，仅支持：1,2,3,4,5,6,10,12,15,20,30"
+                return
+                ;;
+        esac
+
     elif [[ "$cron_type" == "2" ]]; then
         read -r -p "请输入每天固定备份时间 (格式 HH:MM): " cron_time
         if [[ ! "$cron_time" =~ ^([0-1][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
             err "时间格式不正确。"
             return
         fi
+
         hour="${cron_time%:*}"
         minute="${cron_time#*:}"
-        hour="$(echo "$hour" | sed 's/^0*//')"; [[ -z "$hour" ]] && hour="0"
-        minute="$(echo "$minute" | sed 's/^0*//')"; [[ -z "$minute" ]] && minute="0"
+        hour="$(echo "$hour" | sed 's/^0*//')"
+        minute="$(echo "$minute" | sed 's/^0*//')"
+        [[ -z "$hour" ]] && hour="0"
+        [[ -z "$minute" ]] && minute="0"
+
         cron_spec="${minute} ${hour} * * *"
         info "已设置：每天 ${cron_time} 执行一次。"
+
     elif [[ "$cron_type" == "3" ]]; then
-        tmp_cron="$(mktemp)"
+        tmp_cron="$(mktemp)" || {
+            err "创建临时文件失败。"
+            return
+        }
+
         crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
-        crontab "$tmp_cron" 2>/dev/null || true
+
+        if ! crontab "$tmp_cron" 2>/dev/null; then
+            rm -f "$tmp_cron"
+            err "清理定时备份任务失败，请检查 crontab 状态。"
+            return
+        fi
+
         rm -f "$tmp_cron"
         info "定时备份任务已清理。"
         return
+
     else
         err "无效的选择。"
         return
     fi
 
-    tmp_cron="$(mktemp)"
+    tmp_cron="$(mktemp)" || {
+        err "创建临时文件失败。"
+        return
+    }
+
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
+
     cat >> "$tmp_cron" <<EOF
 ${CRON_TAG_BEGIN}
 ${cron_spec} bash ${SCRIPT_PATH} run-backup >> ${BACKUP_LOG} 2>&1
 ${CRON_TAG_END}
 EOF
-    crontab "$tmp_cron" 2>/dev/null || true
+
+    if ! crontab "$tmp_cron" 2>/dev/null; then
+        rm -f "$tmp_cron"
+        err "写入 crontab 失败，请检查 cron 服务状态或脚本路径是否有效。"
+        return
+    fi
+
     rm -f "$tmp_cron"
 
     info "新的定时任务已成功写入 crontab。"
+    echo -e "\033[36m当前计划任务:\033[0m"
+    echo -e "\033[33m${cron_spec} bash ${SCRIPT_PATH} run-backup >> ${BACKUP_LOG} 2>&1\033[0m"
 }
 
 # ---- 8. 彻底卸载 ----
@@ -867,7 +907,7 @@ repair_current_install() {
 
 install_ftp(){
     clear
-    echo -e "${GREEN}📂 FTP/SFTP 备份工具...${RESET}"
+    echo -e "${GREEN-}📂 FTP/SFTP 备份工具...${RESET-}"
     bash <(curl -L https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
     sleep 2
     exit 0
@@ -896,7 +936,7 @@ main_menu() {
     echo "==================================================="
 
     local choice=""
-    read -r -p "请输入操作序号 [0-11]: " choice
+    read -r -p "请输入操作序号 [0-9]: " choice
     case "$choice" in
         1) deploy_cliproxyapi ;;
         2) upgrade_service ;;
