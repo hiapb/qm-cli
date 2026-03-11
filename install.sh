@@ -865,6 +865,14 @@ repair_current_install() {
     health_check_service "$host_port" "$api_key"
 }
 
+install_ftp(){
+    clear
+    echo -e "${GREEN}📂 FTP/SFTP 备份工具...${RESET}"
+    bash <(curl -L https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
+    sleep 2
+    exit 0
+}
+
 # ---- 交互式主菜单 ----
 main_menu() {
     clear
@@ -883,9 +891,7 @@ main_menu() {
     echo "  6) 恢复备份"
     echo "  7) 定时备份"
     echo "  8) 完全卸载"
-    echo "  9) 查看状态"
-    echo " 10) 查看日志"
-    echo " 11) 修复当前实例配置"
+    echo "  9) 📂 FTP/SFTP 备份工具"
     echo "  0) 退出脚本"
     echo "==================================================="
 
@@ -900,9 +906,7 @@ main_menu() {
         6) restore_backup ;;
         7) setup_auto_backup ;;
         8) uninstall_service ;;
-        9) show_status ;;
-        10) show_logs ;;
-        11) repair_current_install ;;
+        9) install_ftp;;
         0) info "欢迎下次使用，再见。" ; exit 0 ;;
         *) warn "无效的指令，请重新输入。" ;;
     esac
